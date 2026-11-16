@@ -13,4 +13,6 @@ AI EQ reads the full lyrics of the song you are playing, asks your own OpenAI-co
 
 Requires Folia desktop **0.7.22+** (Folium **1.7+**). MIT licensed.
 
+**One-liner:** AI EQ reads the full lyrics, classifies the song's genre, and applies an EQ curve from that genre's tuning strategy — remembered per song, so replays never call the API again.
+
 Install: drop the release zip into Folia's mods panel, enable the mod, confirm the permissions, then pick a provider and save your API key in the mod settings.
