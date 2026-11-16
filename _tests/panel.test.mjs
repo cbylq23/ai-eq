@@ -49,7 +49,11 @@ globalThis.document = { createElement, activeElement: null };
 
 const SONG = { id: '1001', title: '晴天', artist: '周杰伦', album: '叶惠美', source: 'netease', ref: 'r1' };
 
-const DEFAULT_CFG = { provider: 'deepseek', baseUrl: '', model: '', strength: 'standard', taste: '', useLyrics: true };
+const DEFAULT_CFG = {
+    provider: 'deepseek', baseUrl: '', model: '', strength: 'standard', taste: '', useLyrics: true,
+    /* v2.2.0 起配置指纹还包含联网资料三项，必须与设置默认值一致。 */
+    webSearch: 'off', searchBaseUrl: '', searchCount: 3,
+};
 
 function songKey(song) {
     return cacheKeyFor(song, settingsFingerprint(DEFAULT_CFG, 10));

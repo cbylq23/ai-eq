@@ -17,12 +17,17 @@ import {
     parseCurvePayload,
     normalizeCurve,
     settingsFingerprint,
+    genreFamilyOf,
+    genreChangeNeedsRegenerate,
     cacheKeyFor,
     songIdentity,
     formatDb,
     frequencyText,
     songTitle,
     LYRICS_CHAR_LIMIT,
+    buildSearchQuery,
+    extractDdgResults,
+    normalizeSearchResults,
 } from './eq.mjs';
 
 const CACHE_STORAGE_KEY = 'aieq-cache-v1';
@@ -35,6 +40,7 @@ const GENRE_MAX_ENTRIES = 800;
 const TASTE_MAX_RATINGS = 500;
 const STATS_MAX_SONGS = 500;
 const REQUEST_TIMEOUT_MS = 45000;
+const SEARCH_TIMEOUT_MS = 12000;
 
 /**
  * 时间参数集中在这里：正式运行时用默认值；测试会把它调小以加快用例。
@@ -134,6 +140,54 @@ const SETTINGS = [
         defaultValue: true,
     },
     {
+        key: 'webSearch',
+        type: 'select',
+        label: { 'zh-CN': '联网资料', en: 'Web research' },
+        description: {
+            'zh-CN': '开启后，生成简报前会先用「歌名 + 歌手」搜索公开资料（创作背景、主题解读），把摘要放进提示词帮模型理解深层含义。只发送歌名与歌手，不发送歌词；搜不到或失败会自动跳过，不影响出曲线。',
+            en: 'Before writing the brief, search the web for public background/meaning using title + artist and add excerpts to the prompt. Only title and artist are sent; failures are skipped silently.',
+        },
+        defaultValue: 'off',
+        options: [
+            { value: 'off', label: { 'zh-CN': '关闭', en: 'Off' } },
+            { value: 'ddg', label: { 'zh-CN': 'DuckDuckGo（免费，无需密钥）', en: 'DuckDuckGo (free, no key)' } },
+            { value: 'tavily', label: { 'zh-CN': 'Tavily（需密钥）', en: 'Tavily (key)' } },
+            { value: 'serper', label: { 'zh-CN': 'Serper / Google（需密钥）', en: 'Serper / Google (key)' } },
+            { value: 'bocha', label: { 'zh-CN': '博查 Bocha（需密钥）', en: 'Bocha (key)' } },
+            { value: 'searxng', label: { 'zh-CN': 'SearXNG（自建实例）', en: 'SearXNG (self-hosted)' } },
+        ],
+    },
+    {
+        key: 'searchApiKey',
+        type: 'secret',
+        label: { 'zh-CN': '搜索 API 密钥', en: 'Search API key' },
+        description: {
+            'zh-CN': '仅 Tavily / Serper / 博查需要；DuckDuckGo 与自建 SearXNG 不需要。和 AI 密钥一样用系统凭据库保存。',
+            en: 'Needed only for Tavily / Serper / Bocha. Stored in the OS credential store.',
+        },
+    },
+    {
+        key: 'searchBaseUrl',
+        type: 'text',
+        label: { 'zh-CN': '搜索地址（SearXNG 用）', en: 'Search base URL (SearXNG)' },
+        description: {
+            'zh-CN': '自建 SearXNG 的根地址，例如 https://searx.example.com；需要实例开启 JSON 输出（format=json）。',
+            en: 'Base URL of your SearXNG instance, e.g. https://searx.example.com; JSON output must be enabled.',
+        },
+        defaultValue: '',
+        placeholder: 'https://searx.example.com',
+    },
+    {
+        key: 'searchCount',
+        type: 'number',
+        label: { 'zh-CN': '资料条数', en: 'Sources per song' },
+        description: { 'zh-CN': '每次最多取几条摘要放进提示词（1–5）。', en: 'How many excerpts to inject (1–5).' },
+        defaultValue: 3,
+        min: 1,
+        max: 5,
+        step: 1,
+    },
+    {
         key: 'priceIn',
         type: 'number',
         label: { 'zh-CN': '输入价格（元 / 百万 tokens）', en: 'Input price (CNY / 1M tokens)' },
@@ -224,6 +278,7 @@ export default function activate(folium) {
         lastRequestAt: 0,
         apiKeyPresent: null,
         busy: false,
+        busyText: '',
         renderers: new Set(),
     };
 
@@ -231,8 +286,8 @@ export default function activate(folium) {
         id: 'eq',
         label: { 'zh-CN': 'AI 智能 EQ', en: 'AI EQ' },
         description: {
-            'zh-CN': '播放歌曲时把歌名、歌手和整首歌词发给大模型，生成「歌曲简报」（一句话、情绪、风格标签、意象、能量起伏）和一条 10 段均衡器曲线；听过的歌直接套用不再调用 AI。你在面板里的 👍/👎 和手动切换音效会被记成口味，之后的请求会参考。API 密钥用系统凭据库保存。',
-            en: 'Song metadata and full lyrics go to your AI provider to write a brief (summary, emotion, tags, imagery, energy arc) and a 10-band EQ curve. Songs already analysed are reused without a new call; your 👍/👎 and manual sound changes teach the taste profile.',
+            'zh-CN': '播放歌曲时把歌名、歌手和整首歌词发给大模型，生成「歌曲简报」（一句话、深层含义、情绪、风格标签、意象、能量起伏）和一条 10 段均衡器曲线；听过的歌直接套用不再调用 AI。开启「联网资料」后，还会先用歌名+歌手搜索公开资料（创作背景/主题解读）帮助模型理解歌曲，只发送歌名与歌手；默认关闭。你在面板里的 👍/👎 和手动切换音效会被记成口味，之后的请求会参考。API 密钥用系统凭据库保存。',
+            en: 'Song metadata and full lyrics go to your AI provider to write a brief (summary, deep meaning, emotion, tags, imagery, energy arc) and a 10-band EQ curve. Songs already analysed are reused without a new call; your 👍/👎 and manual sound changes teach the taste profile. Optional web research (title + artist only) can add public background/meaning excerpts; off by default.',
         },
         settings: SETTINGS,
         settingsPanel: (container, ctx) => mountPanel(container, ctx),
@@ -335,6 +390,7 @@ export default function activate(folium) {
             model: String(entry.model || ''),
             genre: String(entry.genre || '').slice(0, 32),
             brief: entry.brief || null,
+            research: entry.research && typeof entry.research === 'object' ? entry.research : null,
             usage: entry.usage || null,
             at: Number(entry.at) || Date.now(),
         });
@@ -365,6 +421,7 @@ export default function activate(folium) {
                     model: String(value.model || ''),
                     genre: String(value.genre || '').slice(0, 32),
                     brief: value.brief && typeof value.brief === 'object' ? value.brief : null,
+                    research: value.research && typeof value.research === 'object' ? value.research : null,
                     usage: value.usage && typeof value.usage === 'object' ? value.usage : null,
                     at: Number(value.at) || 0,
                 });
@@ -472,22 +529,27 @@ export default function activate(folium) {
         saveGenresSoon();
     }
 
-    /** 用户手动指定 / 清除当前歌曲的曲风；同时让这首歌的旧曲线缓存失效。 */
+    /** 用户手动指定 / 清除当前歌曲的曲风；曲风类别变了就让这首歌的旧曲线失效。 */
     function setUserGenre(song, value) {
         if (!song) return '';
         const identity = songIdentity(song);
         if (!identity) return '';
+        const previous = state.genres.get(identity) || '';
         const text = String(value || '').trim().slice(0, 32);
         if (text) state.genres.set(identity, text);
         else state.genres.delete(identity);
         trimGenres();
         saveGenresSoon();
-        const key = keyFor(song);
-        if (state.cache.has(key)) {
-            state.cache.delete(key);
-            saveCacheSoon();
+        /* 曲风是 EQ 的主要依据：类别变了，旧曲线不能再套用；
+           同一类别内的小改动也重新生成，避免"改了曲风却还是旧曲线"的困惑。 */
+        if (previous !== text) {
+            const key = keyFor(song);
+            if (state.cache.has(key)) {
+                state.cache.delete(key);
+                saveCacheSoon();
+            }
+            if (state.last && state.last.key === key) state.last = null;
         }
-        if (state.last && state.last.key === key) state.last = null;
         renderAll();
         return text;
     }
@@ -803,7 +865,86 @@ export default function activate(folium) {
         }
     }
 
-    async function requestCurve({ song, bandList, conf, snapshot, genre, profile, lyrics }) {
+    // ---------------------------------------------------------------- 联网搜索（帮助理解歌曲深层含义）
+
+    function searchCount(conf) {
+        const value = Math.round(Number(conf && conf.searchCount));
+        if (!Number.isFinite(value)) return 3;
+        return Math.min(5, Math.max(1, value));
+    }
+
+    async function readSearchKey() {
+        try {
+            return await folium.secrets.get('searchApiKey');
+        } catch (error) {
+            folium.log.warn('[ai-eq] 读取搜索密钥失败', String((error && error.message) || error));
+            return null;
+        }
+    }
+
+    /**
+     * 用「歌名 + 歌手」搜索公开资料（创作背景 / 主题解读），给模型理解深层含义用。
+     * 只发送歌名与歌手；失败、没配置或搜不到时返回空列表，不阻塞生成。
+     * 结果里不含 URL，只保留标题/摘要/站名，避免模型复述链接。
+     */
+    async function researchSong(song, conf) {
+        const mode = String((conf && conf.webSearch) || 'off');
+        if (!mode || mode === 'off') return { sources: [], error: '', mode };
+        const query = buildSearchQuery(song);
+        if (!query) return { sources: [], error: '缺少歌名，跳过联网搜索', mode };
+        const count = searchCount(conf);
+        const request = async (url, init) => {
+            const response = await folium.net.fetch(url, { ...(init || {}), timeoutMs: SEARCH_TIMEOUT_MS });
+            if (!response.ok) throw new Error(`搜索接口返回 ${response.status}`);
+            return response;
+        };
+        try {
+            if (mode === 'ddg') {
+                const response = await request(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, { method: 'GET' });
+                const html = String(response.text() || '');
+                return { sources: extractDdgResults(html).slice(0, count), error: '', mode };
+            }
+            const key = await readSearchKey();
+            if (mode === 'searxng') {
+                const base = String((conf && conf.searchBaseUrl) || '').trim().replace(/\/+$/, '');
+                if (!base) throw new Error('未配置 SearXNG 地址');
+                const response = await request(`${base}/search?q=${encodeURIComponent(query)}&format=json&safesearch=0`, { method: 'GET' });
+                return { sources: normalizeSearchResults('searxng', response.json()).slice(0, count), error: '', mode };
+            }
+            if (!key) throw new Error('未配置搜索 API 密钥');
+            if (mode === 'tavily') {
+                const response = await request('https://api.tavily.com/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: key, query, max_results: count, search_depth: 'basic', include_answer: false }),
+                });
+                return { sources: normalizeSearchResults('tavily', response.json()).slice(0, count), error: '', mode };
+            }
+            if (mode === 'serper') {
+                const response = await request('https://google.serper.dev/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-API-KEY': key },
+                    body: JSON.stringify({ q: query, num: count }),
+                });
+                return { sources: normalizeSearchResults('serper', response.json()).slice(0, count), error: '', mode };
+            }
+            if (mode === 'bocha') {
+                const response = await request('https://api.bochaai.com/v1/web-search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+                    body: JSON.stringify({ query, count, summary: true }),
+                });
+                return { sources: normalizeSearchResults('bocha', response.json()).slice(0, count), error: '', mode };
+            }
+            throw new Error(`未知的联网搜索方式：${mode}`);
+        } catch (error) {
+            const message = friendlyError(error);
+            folium.log.warn('[ai-eq] 联网搜索跳过：' + message);
+            return { sources: [], error: message, mode };
+        }
+    }
+
+    async function requestCurve({ song, bandList, conf, snapshot, genre, profile, lyrics, webSources }) {
         const resolved = resolveProvider(conf);
         if (!resolved.model) throw new Error('请先在设置里填写模型名');
         const endpoint = validateEndpoint(resolved.base);
@@ -819,6 +960,7 @@ export default function activate(folium) {
             lyrics,
             genre,
             profile,
+            webSources,
         });
         const body = {
             model: resolved.model,
@@ -943,14 +1085,25 @@ export default function activate(folium) {
 
         const promise = (async () => {
             state.busy = true;
+            state.busyText = '';
             state.error = '';
             renderAll();
             try {
                 const wait = Math.max(0, TUNING.requestGap - (Date.now() - state.lastRequestAt));
                 if (wait) await sleep(wait);
                 state.lastRequestAt = Date.now();
+                let webSources = [];
+                let research = { sources: [], error: '', mode: 'off' };
+                if (String(conf.webSearch || 'off') !== 'off') {
+                    state.busyText = tr('正在联网搜索歌曲背景…', 'Searching the web…');
+                    renderAll();
+                    research = await researchSong(song, conf);
+                    webSources = Array.isArray(research.sources) ? research.sources : [];
+                }
+                state.busyText = tr('正在请求大模型…', 'Asking the model…');
+                renderAll();
                 const result = await requestCurve({
-                    song, bandList, conf, snapshot, genre: knownGenre, profile, lyrics,
+                    song, bandList, conf, snapshot, genre: knownGenre, profile, lyrics, webSources,
                 });
                 if (state.disposed) return null;
                 if (result.genre) rememberGenre(song, result.genre);
@@ -962,6 +1115,12 @@ export default function activate(folium) {
                     model: result.model,
                     genre: result.genre || knownGenre,
                     brief: result.brief,
+                    research: {
+                        mode: research.mode,
+                        count: webSources.length,
+                        sites: [...new Set(webSources.map((item) => item.site).filter(Boolean))].slice(0, 4),
+                        error: research.error || '',
+                    },
                     usage,
                     at: Date.now(),
                 };
@@ -986,6 +1145,7 @@ export default function activate(folium) {
             } finally {
                 state.inflight.delete(key);
                 state.busy = false;
+                state.busyText = '';
                 renderAll();
             }
         })();
@@ -1098,7 +1258,19 @@ export default function activate(folium) {
             return;
         }
         const conf = cfg();
-        const hit = cacheGet(state.key);
+        let hit = cacheGet(state.key);
+        /* 曲风是 EQ 的主要依据：如果这首歌记着的曲风（用户改正过、或从别处导入）
+           和缓存里那条曲线当时的曲风不是同一类，旧曲线不能再套用，按未命中重新生成。 */
+        if (hit) {
+            const wanted = genreFor(song);
+            const cachedGenre = String(hit.genre || '').trim();
+            if (wanted && cachedGenre && genreChangeNeedsRegenerate(cachedGenre, wanted)) {
+                folium.log.info(`[ai-eq] 曲风已从「${cachedGenre}」改为「${wanted}」，旧曲线作废并重新生成`);
+                state.cache.delete(state.key);
+                saveCacheSoon();
+                hit = null;
+            }
+        }
         if (hit) {
             state.last = { ...hit, key: state.key, source: 'cache', adjusted: false, noop: false };
         }
@@ -1335,6 +1507,7 @@ export default function activate(folium) {
 .aieq-chip.dim { opacity:.65; }
 .aieq-energy { display:flex; align-items:flex-end; gap:4px; height:44px; }
 .aieq-energy i { flex:1; background: var(--folium-accent, #6b8afd); border-radius:3px 3px 0 0; min-height:2px; opacity:.85; }
+.aieq-meaning { font-size:12.5px; line-height:1.7; opacity:.9; }
 .aieq-kv { display:flex; justify-content:space-between; gap:12px; font-variant-numeric: tabular-nums; }
 .aieq-kv span:last-child { opacity:.85; }
 `;
@@ -1571,14 +1744,15 @@ export default function activate(folium) {
         endpointLine.className = 'aieq-note';
 
         const controls = new Map();
-        const secret = { input: null, stateText: null };
+        const secretFields = [];
 
         const makeField = (def) => {
             const field = document.createElement('div');
             field.className = 'aieq-field';
+            const labelText = String((def.label && (def.label[locale] || def.label['zh-CN'] || def.label.en)) || def.key);
             const label = document.createElement('div');
             label.className = 'aieq-label';
-            label.textContent = String((def.label && (def.label[locale] || def.label['zh-CN'] || def.label.en)) || def.key);
+            label.textContent = labelText;
             field.append(label);
             if (def.description) {
                 const desc = document.createElement('div');
@@ -1601,12 +1775,12 @@ export default function activate(folium) {
                 save.textContent = L('保存', 'Save');
                 save.addEventListener('click', async () => {
                     const value = input.value.trim();
-                    if (!value) return toast(L('请先粘贴 API 密钥', 'Paste an API key first'), 'error');
+                    if (!value) return toast(L('请先粘贴密钥', 'Paste a key first'), 'error');
                     save.disabled = true;
                     try {
-                        await folium.secrets.set('apiKey', value);
+                        await folium.secrets.set(def.key, value);
                         input.value = '';
-                        toast(L('API 密钥已保存', 'API key saved'), 'success');
+                        toast(L(`${labelText} 已保存`, `${labelText} saved`), 'success');
                         await refreshSecret();
                     } catch (error) {
                         toast(friendlyError(error), 'error');
@@ -1620,8 +1794,8 @@ export default function activate(folium) {
                 clear.textContent = L('清除', 'Clear');
                 clear.addEventListener('click', async () => {
                     try {
-                        await folium.secrets.set('apiKey', null);
-                        toast(L('已清除 API 密钥', 'API key cleared'));
+                        await folium.secrets.set(def.key, null);
+                        toast(L(`已清除${labelText}`, `${labelText} cleared`));
                         await refreshSecret();
                     } catch (error) {
                         toast(friendlyError(error), 'error');
@@ -1632,8 +1806,7 @@ export default function activate(folium) {
                 const stateText = document.createElement('div');
                 stateText.className = 'aieq-desc';
                 field.append(stateText);
-                secret.input = input;
-                secret.stateText = stateText;
+                secretFields.push({ key: def.key, input, stateText });
                 return field;
             }
             if (def.type === 'select') {
@@ -1731,6 +1904,7 @@ export default function activate(folium) {
         const findDef = (key) => SETTINGS.find((def) => def.key === key);
         const groups = [
             { title: L('连接', 'Connection'), keys: ['provider', 'baseUrl', 'model', 'apiKey', 'jsonMode'] },
+            { title: L('联网搜索', 'Web research'), keys: ['webSearch', 'searchApiKey', 'searchBaseUrl', 'searchCount'] },
             { title: L('调节与花费', 'Tuning & cost'), keys: ['strength', 'taste', 'useLyrics', 'priceIn', 'priceOut'] },
             { title: L('自动化', 'Automation'), keys: ['autoApply', 'notify', 'cacheDays'] },
         ];
@@ -1765,11 +1939,12 @@ export default function activate(folium) {
         container.append(style, root);
 
         async function refreshSecret() {
-            let has = false;
-            try { has = await folium.secrets.has('apiKey'); } catch (_) { has = false; }
-            if (!secret.stateText) return;
-            secret.stateText.textContent = has ? L('已保存密钥', 'A key is saved') : L('尚未保存密钥', 'No key saved');
-            if (secret.input) secret.input.placeholder = has ? '••••••••' : L('粘贴 API Key', 'Paste API key');
+            for (const field of secretFields) {
+                let has = false;
+                try { has = await folium.secrets.has(field.key); } catch (_) { has = false; }
+                field.stateText.textContent = has ? L('已保存', 'Saved') : L('尚未保存', 'Not saved');
+                if (field.input) field.input.placeholder = has ? '••••••••' : L('粘贴密钥', 'Paste key');
+            }
         }
 
         function chips(values, className) {
@@ -1813,6 +1988,26 @@ export default function activate(folium) {
             addRow(L('情绪', 'Emotion'), brief.emotion, false);
             addRow(L('风格标签', 'Tags'), brief.tags, false);
             addRow(L('意象', 'Imagery'), brief.imagery, true);
+            if (brief.meaning) {
+                const meaning = document.createElement('div');
+                meaning.className = 'aieq-meaning';
+                meaning.textContent = brief.meaning;
+                rows.splice(Math.min(1, rows.length), 0, meaning);
+            }
+            const research = entry && entry.research && entry.research.mode && entry.research.mode !== 'off' ? entry.research : null;
+            if (research) {
+                const line = document.createElement('div');
+                line.className = 'aieq-desc';
+                line.textContent = research.error
+                    ? L(`联网资料：未取到（${research.error}）`, `Web research: unavailable (${research.error})`)
+                    : research.count
+                        ? L(
+                            `联网资料：${research.count} 条${Array.isArray(research.sites) && research.sites.length ? `（${research.sites.join('、')}）` : ''}`,
+                            `Web research: ${research.count} sources${Array.isArray(research.sites) && research.sites.length ? ` (${research.sites.join(', ')})` : ''}`,
+                        )
+                        : L('联网资料：没有搜到相关结果', 'Web research: no results');
+                rows.push(line);
+            }
             briefMeta.replaceChildren(...rows);
             const energy = Array.isArray(brief.energy) ? brief.energy : [];
             energyWrap.style.display = energy.length >= 2 ? '' : 'none';
@@ -1846,7 +2041,7 @@ export default function activate(folium) {
             }
             if (state.userTookOver) addPill(L('已让位给你：自动施加暂停', 'Paused after your change'), true);
             if (state.pendingApply) addPill(L('曲线待写入（等窗口关闭）', 'Waiting to write'), true);
-            if (state.busy) addPill(L('正在请求大模型…', 'Asking the model…'));
+            if (state.busy) addPill(state.busyText || L('正在请求大模型…', 'Asking the model…'));
             addPill(L(`记忆 ${state.cache.size} 首`, `${state.cache.size} remembered`));
             pills.replaceChildren(...pillNodes);
 
@@ -1854,8 +2049,14 @@ export default function activate(folium) {
 
             const genreValue = state.song ? genreFor(state.song) : '';
             if (!isEditing(genreInput)) genreInput.value = genreValue;
+            const genreFamily = genreFamilyOf(genreValue);
             genreText.textContent = state.song
-                ? (genreValue ? L('当前曲风：' + genreValue, `Genre: ${genreValue}`) : L('曲风未知，保存后会随请求发给模型', 'Genre unknown; a saved value is sent with requests'))
+                ? (genreValue
+                    ? L(
+                        genreFamily ? `当前曲风：${genreValue}（按「${genreFamily.label}」的调音策略）` : `当前曲风：${genreValue}`,
+                        genreFamily ? `Genre: ${genreValue} (${genreFamily.label} tuning)` : `Genre: ${genreValue}`,
+                    )
+                    : L('曲风未知，保存后会随请求发给模型', 'Genre unknown; a saved value is sent with requests'))
                 : '';
             genreSave.disabled = !state.song;
             genreRegen.disabled = !state.song || state.busy;
@@ -2267,6 +2468,26 @@ export default function activate(folium) {
                 addRow(L('情绪', 'Emotion'), brief.emotion, false);
                 addRow(L('标签', 'Tags'), brief.tags, false);
                 addRow(L('意象', 'Imagery'), brief.imagery, true);
+                if (brief.meaning) {
+                    const meaning = document.createElement('div');
+                    meaning.className = 'aieq-meaning';
+                    meaning.textContent = brief.meaning;
+                    rows.splice(Math.min(1, rows.length), 0, meaning);
+                }
+                const research = entry.research && entry.research.mode && entry.research.mode !== 'off' ? entry.research : null;
+                if (research) {
+                    const line = document.createElement('div');
+                    line.className = 'aieq-desc';
+                    line.textContent = research.error
+                        ? L(`联网资料：未取到（${research.error}）`, `Web research: unavailable (${research.error})`)
+                        : research.count
+                            ? L(
+                                `联网资料：${research.count} 条${Array.isArray(research.sites) && research.sites.length ? `（${research.sites.join('、')}）` : ''}`,
+                                `Web research: ${research.count} sources${Array.isArray(research.sites) && research.sites.length ? ` (${research.sites.join(', ')})` : ''}`,
+                            )
+                            : L('联网资料：没有搜到相关结果', 'Web research: no results');
+                    rows.push(line);
+                }
                 const energy = Array.isArray(brief.energy) ? brief.energy : [];
                 if (energy.length >= 2) {
                     const wrap = document.createElement('div');

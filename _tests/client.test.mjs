@@ -1,9 +1,9 @@
-﻿// _tests/client.test.mjs — 用 mock 宿主驱动 client.mjs 的关键场景（node --test _tests/）
+// _tests/client.test.mjs — 用 mock 宿主驱动 client.mjs 的关键场景（node --test _tests/）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import activate, { TUNING } from '../ai-eq/client.mjs';
-import { cacheKeyFor, settingsFingerprint } from '../_src/eq.mjs';
+import { cacheKeyFor, settingsFingerprint, songIdentity } from '../_src/eq.mjs';
 import {
     createHost,
     chatResponse,
@@ -25,7 +25,11 @@ TUNING.generateDelay = 5;
 const SONG_A = { id: '1001', title: '晴天', artist: '周杰伦', album: '叶惠美', source: 'netease', ref: 'r1' };
 const SONG_B = { id: '2002', title: 'Lemon', artist: '米津玄師', album: 'STRAY SHEEP', source: 'netease', ref: 'r2' };
 
-const DEFAULTS = { provider: 'deepseek', baseUrl: '', model: '', strength: 'standard', taste: '', useLyrics: true };
+const DEFAULTS = {
+    provider: 'deepseek', baseUrl: '', model: '', strength: 'standard', taste: '', useLyrics: true,
+    /* v2.2.0 起配置指纹还包含联网资料三项，必须与设置默认值一致，否则算出来的缓存键对不上。 */
+    webSearch: 'off', searchBaseUrl: '', searchCount: 3,
+};
 
 /** 一条带完整简报的模型回答。 */
 function briefContent(overrides = {}) {
@@ -141,7 +145,7 @@ test('未命中缓存：请求大模型、校验后施加并写入缓存', async
     assert.match(body.messages[0].content, /制作人|调音/);
     assert.match(body.messages[0].content, /31Hz/);
     assert.match(body.messages[1].content, /晴天/);
-    assert.match(body.messages[1].content, /请先写简报/);
+    assert.match(body.messages[1].content, /请先理解这首歌的深层含义并写简报/);
     assert.equal(call.init.headers.Authorization, 'Bearer sk-test');
 
     await sleep(40);
@@ -593,3 +597,64 @@ test('清除记忆不会清掉口味与统计', async () => {
     dispose();
 });
 
+
+test('已知曲风：提示词要求按归类后的曲风策略定基调', async () => {
+    const host = createHost({
+        fetchImpl: async () => okResponse(chatResponse(curveContent([1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))),
+    });
+    host.storageMap.set('aieq-genres-v1', { v: 1, entries: { [songIdentity(SONG_A)]: 'City Pop' } });
+    host.secretsMap.set('apiKey', 'k');
+    const { dispose, ready } = start(host);
+    await ready;
+    await host.emit('playback.songChanged', { song: SONG_A });
+    assert.ok(await waitFor(() => host.fetchCalls.length === 1));
+    const system = bodyOf(host.fetchCalls[0]).messages[0].content;
+    const user = bodyOf(host.fetchCalls[0]).messages[1].content;
+    assert.match(system, /曲风驱动 EQ/);
+    assert.match(system, /曲风的权重高于历史口味/);
+    assert.match(user, /曲风（请沿用，不要改写）：City Pop/);
+    assert.match(user, /City Pop \/ 合成器流行/, '应告诉模型按哪一类策略定基调');
+    dispose();
+});
+
+test('曲风被改成另一类时：旧曲线作废并重新生成', async () => {
+    const oldCurve = [3, 3, 3, 0, 0, 0, 0, 0, 0, 0];
+    const newCurve = [0, 0, 0, 1, 1, 1, 0, 0, 0, 0];
+    const host = createHost({
+        fetchImpl: async () => okResponse(chatResponse(curveContent(newCurve, '说唱按 808 调', 0.8))),
+    });
+    host.storageMap.set('aieq-cache-v1', cachePayload({
+        [songKey(SONG_A)]: { curve: oldCurve, genre: 'City Pop', reason: '旧曲线', confidence: 0.9, model: 'm', at: Date.now() },
+    }));
+    host.storageMap.set('aieq-genres-v1', { v: 1, entries: { [songIdentity(SONG_A)]: 'Trap' } });
+    host.secretsMap.set('apiKey', 'k');
+    const { dispose, ready } = start(host);
+    await ready;
+    await host.emit('playback.songChanged', { song: SONG_A });
+    assert.ok(await waitFor(() => host.applyCalls.length === 1), '应重新生成并施加新曲线');
+    assert.deepEqual(host.applyCalls[0], newCurve, '旧的 City Pop 曲线不能再用');
+    assert.equal(host.fetchCalls.length, 1);
+    dispose();
+});
+
+test('联网资料：先搜歌名+歌手，再把摘要放进提示词（只为理解含义）', async () => {
+    const searchHtml = '<div class="result"><a class="result__a" href="#">晴天 创作背景解读</a><a class="result__snippet">这首歌写于一个夏天。</a></div>';
+    const host = createHost({
+        settings: { webSearch: 'ddg' },
+        fetchImpl: async (url) => (String(url).includes('duckduckgo')
+            ? okResponse(searchHtml)
+            : okResponse(chatResponse(curveContent([1, 0, 0, 0, 0, 0, 0, 0, 0, 1])))),
+    });
+    host.secretsMap.set('apiKey', 'k');
+    const { dispose, ready } = start(host);
+    await ready;
+    await host.emit('playback.songChanged', { song: SONG_A });
+    assert.ok(await waitFor(() => host.fetchCalls.length >= 2), '应先搜索再请求模型');
+    assert.match(host.fetchCalls[0].url, /duckduckgo/);
+    assert.match(host.fetchCalls[0].url, new RegExp(encodeURIComponent('晴天')));
+    const chat = host.fetchCalls[1];
+    const user = bodyOf(chat).messages[1].content;
+    assert.match(user, /【联网资料】/);
+    assert.match(user, /创作背景解读/);
+    dispose();
+});

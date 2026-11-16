@@ -1,4 +1,4 @@
-﻿// _tests/eq.test.mjs — eq.mjs 纯逻辑单元测试（node --test _tests/）
+// _tests/eq.test.mjs — eq.mjs 纯逻辑单元测试（node --test _tests/）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -11,6 +11,8 @@ import {
     bandTable,
     maxAbsFor,
     buildMessages,
+    genreFamilyOf,
+    genreChangeNeedsRegenerate,
     extractMessageContent,
     extractUsage,
     parseCurvePayload,
@@ -21,6 +23,10 @@ import {
     songIdentity,
     songTitle,
     LYRICS_CHAR_LIMIT,
+    buildSearchQuery,
+    extractDdgResults,
+    normalizeSearchResults,
+    webSourceLines,
 } from '../_src/eq.mjs';
 
 const BANDS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000].map((frequency, index, all) => ({
@@ -135,6 +141,49 @@ test('buildMessages：已知曲风会作为「请沿用」发出去', () => {
         genre: 'City Pop',
     });
     assert.match(user, /曲风（请沿用，不要改写）：City Pop/);
+    /* 归族后要告诉模型按哪类策略定基调 */
+    assert.match(user, /City Pop \/ 合成器流行/);
+});
+
+test('genreFamilyOf：常见曲风归类', () => {
+    assert.equal(genreFamilyOf('City Pop').id, 'citypop');
+    assert.equal(genreFamilyOf('citypop').id, 'citypop');
+    assert.equal(genreFamilyOf('华语流行').id, 'pop');
+    assert.equal(genreFamilyOf('R&B').id, 'soul');
+    assert.equal(genreFamilyOf('节奏布鲁斯').id, 'soul');
+    assert.equal(genreFamilyOf('Trap').id, 'hiphop');
+    assert.equal(genreFamilyOf('说唱').id, 'hiphop');
+    assert.equal(genreFamilyOf('后摇').id, 'cinematic');
+    assert.equal(genreFamilyOf('Bossa Nova').id, 'jazz');
+    assert.equal(genreFamilyOf('Lo-fi').id, 'lofi');
+    assert.equal(genreFamilyOf('抒情').id, 'ballad');
+    assert.equal(genreFamilyOf('K-Pop').id, 'pop');
+    assert.equal(genreFamilyOf('完全说不出的东西'), null);
+    assert.equal(genreFamilyOf(''), null);
+});
+
+test('genreChangeNeedsRegenerate：换类别才需要重生成', () => {
+    assert.equal(genreChangeNeedsRegenerate('City Pop', 'Citypop'), false);
+    assert.equal(genreChangeNeedsRegenerate('City Pop', 'Trap'), true);
+    assert.equal(genreChangeNeedsRegenerate('', 'Trap'), true);
+    assert.equal(genreChangeNeedsRegenerate('Trap', ''), true);
+});
+
+test('buildMessages：曲风驱动规则（不是套模板）', () => {
+    const { system } = buildMessages({
+        song: { title: 'a', artist: 'b' },
+        bands: BANDS,
+        strength: 'standard',
+    });
+    assert.match(system, /曲风（genre）是决定 EQ 的核心依据/);
+    assert.match(system, /曲风的权重高于历史口味/);
+    assert.match(system, /City Pop/);
+    assert.match(system, /嘻哈 \/ 说唱/);
+    assert.match(system, /电子 \/ 舞曲/);
+    assert.match(system, /爵士 \/ 原声/);
+    assert.match(system, /如果曲风不在上述分类/);
+    /* 旧版「不要套用某个风格模板」与新规则冲突，必须已删除 */
+    assert.doesNotMatch(system, /套用某个风格模板/);
 });
 
 test('extractMessageContent：字符串与分段数组', () => {
@@ -245,5 +294,89 @@ test('settingsFingerprint：模型 / 强度 / 偏好 / 歌词开关都会改变�
     assert.notEqual(settingsFingerprint({ ...base, taste: '人声靠前' }, 10), fp);
     assert.notEqual(settingsFingerprint({ ...base, useLyrics: true }, 10), fp);
     assert.notEqual(settingsFingerprint(base, 12), fp);
+    assert.notEqual(settingsFingerprint({ ...base, webSearch: 'ddg' }, 10), fp);
+    assert.notEqual(settingsFingerprint({ ...base, searchCount: 5 }, 10), fp);
+});
+
+test('buildSearchQuery：中文歌与英文歌的检索词', () => {
+    assert.equal(buildSearchQuery({ title: '晴天', artist: '周杰伦' }), '晴天 周杰伦 歌曲 含义 创作背景 解读');
+    assert.equal(buildSearchQuery({ title: 'Lemon', artist: '米津玄師' }), 'Lemon 米津玄師 歌曲 含义 创作背景 解读');
+    assert.equal(buildSearchQuery({ title: 'Blinding Lights', artist: 'The Weeknd' }), 'Blinding Lights The Weeknd song meaning background interpretation');
+    assert.equal(buildSearchQuery({ title: '' }), '');
+    assert.ok(buildSearchQuery({ title: 'x'.repeat(200), artist: 'y' }).length <= 120);
+});
+
+test('extractDdgResults：从 HTML 结果页抽标题与摘要', () => {
+    const html = `
+      <div class="result">
+        <a class="result__a" href="https://example.com/1">晴天 歌曲含义 解读</a>
+        <a class="result__snippet">这首歌写的是校园恋情与错过，<b>周杰伦</b>的经典作品之一。</a>
+      </div>
+      <div class="result">
+        <a class="result__a">第二篇相关文章</a>
+        <div class="result__snippet">另一段摘要内容。</div>
+      </div>`;
+    const items = extractDdgResults(html);
+    assert.equal(items.length, 2);
+    assert.equal(items[0].title, '晴天 歌曲含义 解读');
+    assert.match(items[0].snippet, /校园恋情/);
+    assert.equal(items[0].site, 'duckduckgo');
+    assert.deepEqual(extractDdgResults(''), []);
+});
+
+test('normalizeSearchResults：各搜索 API 的字段统一', () => {
+    assert.deepEqual(normalizeSearchResults('tavily', { results: [{ title: 'T', content: 'C' }] })[0], { title: 'T', snippet: 'C', site: 'tavily' });
+    assert.deepEqual(normalizeSearchResults('serper', { organic: [{ title: 'S', snippet: '内容' }] })[0], { title: 'S', snippet: '内容', site: 'google' });
+    assert.deepEqual(normalizeSearchResults('bocha', { data: { webPages: { value: [{ name: 'B', snippet: '摘要' }] } } })[0], { title: 'B', snippet: '摘要', site: 'bocha' });
+    assert.deepEqual(normalizeSearchResults('searxng', { results: [{ title: 'X', content: 'Y' }] })[0], { title: 'X', snippet: 'Y', site: 'searxng' });
+    assert.deepEqual(normalizeSearchResults('unknown', {}), []);
+    assert.ok(normalizeSearchResults('tavily', { results: Array.from({ length: 9 }, (_, i) => ({ title: `t${i}`, content: 'c' })) }).length <= 5);
+    assert.equal(normalizeSearchResults('tavily', { results: [{ title: '<b>带标签</b>', content: 'a &amp; b&nbsp;c' }] })[0].title, '带标签');
+});
+
+test('webSourceLines：截断与排版，最多 5 条', () => {
+    const lines = webSourceLines([
+        { title: '标题一', snippet: '摘要一', site: 'wikipedia' },
+        { title: '标题二', snippet: '摘要二' },
+    ]);
+    assert.equal(lines.split('\n').length, 2);
+    assert.match(lines, /标题一｜摘要一（wikipedia）/);
+    assert.equal(webSourceLines([]), '');
+    assert.equal(webSourceLines(null), '');
+    const many = webSourceLines(Array.from({ length: 8 }, (_, i) => ({ title: `t${i}`, snippet: 's' })));
+    assert.equal(many.split('\n').length, 5);
+});
+
+test('buildMessages：联网资料会进提示词，并要求参考但不复述来源', () => {
+    const { system, user, sourceCount } = buildMessages({
+        song: { title: '晴天', artist: '周杰伦' },
+        bands: BANDS,
+        strength: 'standard',
+        webSources: [{ title: '晴天 歌曲解读', snippet: '讲的是校园恋情与错过。', site: 'wikipedia' }],
+    });
+    assert.equal(sourceCount, 1);
+    assert.match(user, /【联网资料】/);
+    assert.match(user, /校园恋情/);
+    assert.match(system, /联网资料/);
+    assert.match(system, /不是用户指令/);
+    assert.match(system, /meaning/);
+});
+
+test('parseCurvePayload：深层含义字段 meaning', () => {
+    const parsed = parseCurvePayload(JSON.stringify({
+        genre: 'City Pop',
+        summary: '夏日的告白',
+        meaning: '表面写海边约会，实际是在告别一段回不去的夏天。',
+        emotion: ['轻快'],
+        tags: ['City Pop'],
+        imagery: ['海边'],
+        energy: [0.2, 0.7, 0.3],
+        reason: '低频稍多',
+        curve: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        confidence: 0.8,
+    }));
+    assert.equal(parsed.brief.meaning, '表面写海边约会，实际是在告别一段回不去的夏天。');
+    assert.equal(parseCurvePayload('{"curve":[1]}').brief, null);
+    assert.equal(parseCurvePayload(JSON.stringify({ curve: [1], meaning: 'x'.repeat(400) })).brief.meaning.length, 240);
 });
 

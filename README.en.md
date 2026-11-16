@@ -1,8 +1,11 @@
-# AI EQ — AI song brief & automatic equalizer for Folia
+# AI EQ — AI song brief & genre-driven equalizer for Folia
 
 AI EQ reads the full lyrics of the song you are playing, asks your own OpenAI-compatible provider for a short **song brief** (one-line summary, mood, style tags, imagery, energy arc) and a **10-band EQ curve**, then applies it to Folia's built-in equalizer.
 
+- **Genre-driven EQ (v2.3.0).** The prompt classifies the song into one of ten tuning families (pop, City Pop/synth-pop, R&B, rock/metal, electronic/dance, hip-hop, jazz/classical/acoustic, ballad, indie/lo-fi, cinematic/ambient) with explicit per-band ranges; genre sets the baseline and mood/energy only fine-tune it. The panel shows which family the song is tuned by, and editing the genre invalidates the old curve.
+
 - **One request per song.** Brief, curve, genre and token usage are remembered per song; replaying a song never calls the API again.
+- **Web research (optional).** Before writing the brief, search public background/meaning with title + artist only (DuckDuckGo, Tavily, Serper, Bocha or your own SearXNG); off by default.
 - **Taste learning.** Your 👍/👎 and manual sound changes are recorded and gently used for songs with a similar vibe.
 - **Player-page entry.** A button at the right of the progress bar opens the AI EQ tab: current EQ, song tags, your rating, generate/A-B/undo.
 - **Costs visible.** Per-song and total calls, tokens and estimated cost (your own prices).

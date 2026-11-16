@@ -70,7 +70,7 @@ def make():
 
     # 顶部徽标
     badge_font = font(17, bold=True)
-    badge_text = "FOLIUM MOD  ·  AI EQ 2.1  ·  歌曲简报 + 智能 EQ"
+    badge_text = "FOLIUM MOD  ·  AI EQ 2.2  ·  歌曲简报 + 智能 EQ"
     bbox = draw.textbbox((0, 0), badge_text, font=badge_font)
     badge_w = bbox[2] - bbox[0] + 36
     rounded(draw, [66, 44, 66 + badge_w, 82], 19, fill=(22, 34, 58), outline=(64, 96, 158), width=1)
@@ -159,7 +159,7 @@ def make():
     draw.text((1000, 608), "听过的歌不再调用 AI", font=font(15, bold=True), fill=(120, 230, 190))
 
     # 底部
-    draw.text((66, 662), "整首歌词  ·  歌曲简报  ·  每首记忆  ·  好评/差评 口味学习  ·  进度条按钮 · token 与花费统计",
+    draw.text((66, 662), "整首歌词  ·  歌曲简报  ·  联网资料  ·  记忆  ·  好评/差评  ·  花费统计",
               font=font(19), fill=(130, 148, 178))
     footer = "Folia 0.7.22+  ·  Folium 1.7+  ·  仅桌面版"
     fb = draw.textbbox((0, 0), footer, font=font(16))
@@ -171,6 +171,8 @@ def make():
 
 if __name__ == "__main__":
     make()
+
+
 
 
 
