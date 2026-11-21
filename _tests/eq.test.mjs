@@ -11,6 +11,10 @@ import {
     bandTable,
     maxAbsFor,
     buildMessages,
+    buildCompactMessages,
+    maxOutputTokens,
+    OUTPUT_TOKENS_MAX,
+    COMPACT_LYRICS_CHAR_LIMIT,
     genreFamilyOf,
     genreChangeNeedsRegenerate,
     extractMessageContent,
@@ -186,6 +190,33 @@ test('buildMessages：曲风驱动规则（不是套模板）', () => {
     assert.doesNotMatch(system, /套用某个风格模板/);
 });
 
+test('maxOutputTokens：预算随段数增长且不超过上限', () => {
+    assert.ok(maxOutputTokens(10) >= 700, '10 段时至少要给 700 tokens');
+    assert.equal(maxOutputTokens(10), 760);
+    assert.equal(maxOutputTokens(undefined), 760, '段数未知按 10 段算');
+    assert.equal(maxOutputTokens(40), 940, '段数多时预算跟着涨');
+    assert.equal(maxOutputTokens(2000), OUTPUT_TOKENS_MAX, '不超过 4096 上限');
+});
+
+test('buildCompactMessages：只要曲风+曲线，歌词截断并给出归属', () => {
+    const lyrics = Array.from({ length: 400 }, (_, index) => `第${index + 1}句`).join('\n');
+    const { system, user } = buildCompactMessages({
+        song: { title: '晴天', artist: '周杰伦' },
+        bands: BANDS,
+        strength: 'standard',
+        genre: 'City Pop',
+        lyrics,
+    });
+    assert.match(system, /只输出一个 JSON 对象/);
+    assert.match(system, /正好 10 个数/);
+    assert.match(system, /City Pop/);
+    assert.match(user, /曲风（请原样沿用）：City Pop（归属：City Pop \/ 合成器流行）/);
+    assert.match(user, /晴天/);
+    assert.ok(user.includes('第1句'), '应带上歌词节选');
+    assert.ok(user.length < COMPACT_LYRICS_CHAR_LIMIT + 400, '歌词只送节选，不整首');
+    assert.ok(!/summary|meaning/u.test(system) || /JSON/.test(system), '精简版不再要求简报');
+});
+
 test('extractMessageContent：字符串与分段数组', () => {
     assert.deepEqual(
         extractMessageContent({ choices: [{ message: { content: ' hi ' }, finish_reason: 'stop' }] }),
@@ -233,7 +264,28 @@ test('parseCurvePayload：简报字段、代码块、别名、字段校验', () 
     assert.match(parseCurvePayload('').error, /空内容/);
 });
 
-test('normalizeCurve：限幅、补零、超长拒绝、非数字拒绝', () => {
+test('parseCurvePayload：输出被截断时抢救 curve 与已完成的字段', () => {
+    /* 真实场景：模型把 curve 写在后面，输出在 reason 中途撞到 max_tokens。 */
+    const truncated = '{"genre":"City Pop","summary":"夏日海边的告白","meaning":"写的是青春期的心动","emotion":["轻快","怀旧"],"curve":[2,1,0,0,-1,-1,0,1,2,1],"reason":"低频稍多，人声略';
+    const parsed = parseCurvePayload(truncated);
+    assert.equal(parsed.error, undefined, '截断的 JSON 不应整条失败');
+    assert.equal(parsed.salvaged, true);
+    assert.deepEqual(parsed.curve, [2, 1, 0, 0, -1, -1, 0, 1, 2, 1]);
+    assert.equal(parsed.genre, 'City Pop');
+    assert.equal(parsed.brief.summary, '夏日海边的告白');
+
+    /* 截断在 curve 数组中间：只认已出现的数字，交给 normalizeCurve 补零。 */
+    const partial = parseCurvePayload('{"genre":"Rap","curve":[3, 2, 1, 0');
+    assert.equal(partial.error, undefined);
+    assert.equal(partial.salvaged, true);
+    assert.deepEqual(partial.curve, [3, 2, 1, 0]);
+
+    /* 连 curve 都没写出来：仍然报错（可触发精简重试）。 */
+    const noCurve = parseCurvePayload('{"genre":"City Pop","summary":"夏日海边的告白","curve":[');
+    assert.match(noCurve.error, /不完整|JSON/);
+});
+
+test('normalizeCurve：限幅、补零、超长截断、非数字拒绝', () => {
     const clamped = normalizeCurve([20, 0, 0, 0, 0, 0, -20, 0, 0, 0], { bands: BANDS, minGain: -12, maxGain: 12, maxAbs: 6 });
     assert.deepEqual(clamped.curve.slice(0, 2), [6, 3], '限幅到 ±6，且相邻段被限制到 ≤3 dB');
     assert.equal(clamped.curve[6], -3, '负向同样限幅并限斜率');
@@ -244,12 +296,17 @@ test('normalizeCurve：限幅、补零、超长拒绝、非数字拒绝', () => 
     assert.equal(padded.curve.length, 10);
     assert.deepEqual(padded.curve.slice(0, 3), [1, 2, 0]);
 
-    assert.match(normalizeCurve(Array.from({ length: 12 }, () => 0), { bands: BANDS }).error, /超过/);
+    /* 多于均衡器段数：只取前面的段，并标记 trimmed（不再整条丢弃）。 */
+    const trimmed = normalizeCurve(Array.from({ length: 12 }, (_, index) => index % 2), { bands: BANDS, maxAbs: 6 });
+    assert.equal(trimmed.error, undefined);
+    assert.equal(trimmed.curve.length, 10);
+    assert.equal(trimmed.trimmed, true);
     assert.match(normalizeCurve(['a'], { bands: BANDS }).error, /数字/);
     assert.match(normalizeCurve([], { bands: BANDS }).error, /空/);
 
     const flat = normalizeCurve([0, 0, 0, 0, 0, 0, 0, 0, 0, 0], { bands: BANDS });
     assert.equal(flat.noop, true);
+    assert.equal(flat.trimmed, false);
 });
 
 test('normalizeCurve：相邻段限斜率，避免锯齿', () => {

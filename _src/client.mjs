@@ -12,6 +12,8 @@ import {
     validateEndpoint,
     maxAbsFor,
     buildMessages,
+    buildCompactMessages,
+    maxOutputTokens,
     extractMessageContent,
     extractUsage,
     parseCurvePayload,
@@ -965,7 +967,8 @@ export default function activate(folium) {
         const body = {
             model: resolved.model,
             temperature: 0.4,
-            max_tokens: 900,
+            /* 预算按段数估算：900 对中文简报 + 曲线太紧，模型常在 curve 之前被截断。 */
+            max_tokens: maxOutputTokens(bandList.length),
             stream: false,
             messages: [
                 { role: 'system', content: system },
@@ -994,7 +997,7 @@ export default function activate(folium) {
             if (response.ok) break;
             let text = '';
             try { text = String(response.text() || ''); } catch (_) { text = ''; }
-            if (response.status === 400 && fallbacks < 2) {
+            if (response.status === 400 && fallbacks < 3) {
                 if (body.response_format && /response_format|json_object/i.test(text)) {
                     folium.log.info('[ai-eq] 服务商不支持 response_format，回退为纯提示词 JSON');
                     delete body.response_format;
@@ -1007,22 +1010,96 @@ export default function activate(folium) {
                     fallbacks += 1;
                     continue;
                 }
+                /* 有些服务商的 max_tokens 上限比官方小（或只认 max_completion_tokens）。 */
+                if (body.max_tokens !== undefined && /max_tokens|token limit|maximum context|too large/i.test(text)) {
+                    folium.log.info('[ai-eq] 服务商拒绝 max_tokens=' + body.max_tokens + '，改用 max_completion_tokens');
+                    body.max_completion_tokens = body.max_tokens;
+                    delete body.max_tokens;
+                    fallbacks += 1;
+                    continue;
+                }
             }
             throw new Error(httpError(response.status, text));
         }
 
-        let payload;
-        try {
-            payload = response.json();
-        } catch (_) {
-            throw new Error('接口返回的不是 JSON，请检查接口地址是否指向 chat/completions');
+        const readPayload = () => {
+            let payload;
+            try {
+                payload = response.json();
+            } catch (_) {
+                throw new Error('接口返回的不是 JSON，请检查接口地址是否指向 chat/completions');
+            }
+            return payload;
+        };
+
+        let payload = readPayload();
+        let { content, finishReason } = extractMessageContent(payload);
+        let usage = extractUsage(payload);
+        let parsed = content ? parseCurvePayload(content) : { error: '模型返回了空内容，请检查模型与配额' };
+
+        /* 截断 / JSON 不完整 / 缺 curve：换精简提示词重试一次。
+           完整版提示词要求简报+曲线一起输出，中文模型常在 curve 之前就撞到输出上限；
+           精简版只要曲风判定与曲线，几乎不会超。 */
+        const recoverable = finishReason === 'length' || Boolean(parsed.error) || parsed.salvaged;
+        if (recoverable) {
+            folium.log.info(`[ai-eq] 输出不完整（finish_reason=${finishReason || 'null'}，${parsed.error || '已抢救部分字段'}），改用精简提示词重试`);
+            const compact = buildCompactMessages({ song, bands: bandList, strength: conf.strength, genre, lyrics });
+            body.messages = [
+                { role: 'system', content: compact.system },
+                { role: 'user', content: compact.user },
+            ];
+            body.max_tokens = maxOutputTokens(bandList.length);
+            try {
+                let retryResponse;
+                for (;;) {
+                    retryResponse = await send();
+                    if (retryResponse.ok) break;
+                    let text = '';
+                    try { text = String(retryResponse.text() || ''); } catch (_) { text = ''; }
+                    if (retryResponse.status === 400 && body.response_format) {
+                        delete body.response_format;
+                        continue;
+                    }
+                    if (retryResponse.status === 400 && body.max_tokens !== undefined && /max_tokens|token limit/i.test(text)) {
+                        body.max_completion_tokens = body.max_tokens;
+                        delete body.max_tokens;
+                        continue;
+                    }
+                    throw new Error(httpError(retryResponse.status, text));
+                }
+                response = retryResponse;
+                payload = readPayload();
+                const second = extractMessageContent(payload);
+                content = second.content;
+                finishReason = second.finishReason;
+                const secondUsage = extractUsage(payload);
+                if (secondUsage) {
+                    usage = {
+                        prompt: (Number(usage && usage.prompt) || 0) + secondUsage.prompt,
+                        completion: (Number(usage && usage.completion) || 0) + secondUsage.completion,
+                        total: (Number(usage && usage.total) || 0) + secondUsage.total,
+                    };
+                }
+                const secondParsed = content ? parseCurvePayload(content) : { error: '模型返回了空内容' };
+                if (!secondParsed.error && !secondParsed.salvaged) parsed = secondParsed;
+                else if (!parsed.error || parsed.salvaged) {
+                    /* 重试仍不完整：保留先前抢救到的字段，但提示用户。 */
+                    folium.log.warn('[ai-eq] 精简提示词重试后输出仍不完整');
+                } else {
+                    parsed = secondParsed;
+                }
+            } catch (error) {
+                folium.log.warn('[ai-eq] 精简提示词重试失败：' + friendlyError(error));
+            }
         }
-        const { content, finishReason } = extractMessageContent(payload);
-        const usage = extractUsage(payload);
-        if (finishReason === 'length') throw new Error('模型输出被截断（finish_reason=length），请换输出更长的模型或降低强度');
+
+        if (parsed.error) {
+            if (finishReason === 'length') {
+                throw new Error('模型输出被截断（finish_reason=length），已在精简模式下重试仍未成功；请换输出上限更大的模型，或把「调整强度」调低再试');
+            }
+            throw new Error(parsed.error);
+        }
         if (!content) throw new Error('模型返回了空内容，请检查模型与配额');
-        const parsed = parseCurvePayload(content);
-        if (parsed.error) throw new Error(parsed.error);
 
         const normalized = normalizeCurve(parsed.curve, {
             bands: bandList,
@@ -1043,7 +1120,7 @@ export default function activate(folium) {
             confidence: parsed.confidence,
             model: resolved.model,
             usage,
-            adjusted: normalized.clamped || normalized.smoothed,
+            adjusted: normalized.clamped || normalized.smoothed || normalized.trimmed,
             noop: normalized.noop,
         };
     }

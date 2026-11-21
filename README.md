@@ -7,7 +7,7 @@
 ![Folia](https://img.shields.io/badge/Folia-0.7.22%2B-6b8afd)
 ![Folium](https://img.shields.io/badge/Folium-1.7%2B-6b8afd)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Release](https://img.shields.io/badge/release-v2.3.0-blue)
+![Release](https://img.shields.io/badge/release-v2.3.1-blue)
 
 ## 这是什么
 
@@ -32,6 +32,7 @@ Folia 是一款以全屏歌词为核心的桌面音乐播放器。这个模组�
 
 ## 功能
 
+- **输出截断自愈（v2.3.1）**：输出预算按段数给足；被截断时先抢救已写出的曲线，再自动切换「只输出曲风+曲线」的精简提示词重试一次，不再直接失败。
 - **曲风驱动 EQ（v2.3.0）**：提示词按十类音色策略给出明确的频段范围（流行、City Pop/合成器流行、R&B、摇滚/金属、电子/舞曲、嘻哈/说唱、爵士/古典/原声、抒情慢歌、独立/Lo-fi、电影原声/氛围），先由曲风定基调，情绪与能量只做微调；面板显示「当前曲风：X（按某类策略调音）」，改曲风即重生成。
 - **歌曲简报**：一句话概括、1–4 个情绪词、2–6 个风格标签、2–6 个歌词意象、4–8 段能量起伏（柱状图）。
 - **联网资料（v2.2.0）**：可选先用「歌名 + 歌手」搜索创作背景/主题解读，把摘要放进提示词帮模型理解深层含义；支持 DuckDuckGo（免费）、Tavily、Serper/Google、博查 Bocha、自建 SearXNG，默认关闭，只发送歌名与歌手。
@@ -47,7 +48,7 @@ Folia 是一款以全屏歌词为核心的桌面音乐播放器。这个模组�
 ### 从模组市场 / zip 安装
 
 1. Folia：**设置 → 高级 → 模组**，打开「模组系统」（桌面版才有）。
-2. 命令面板执行「模组」，把 `ai-eq-2.3.0.zip` 拖进面板；或解压到 `%APPDATA%\Folia\mods\ai-eq`。
+2. 命令面板执行「模组」，把 `ai-eq-2.3.1.zip` 拖进面板；或解压到 `%APPDATA%\Folia\mods\ai-eq`。
 3. 启用「AI 智能 EQ」，在原生确认窗口确认权限。
 4. 展开模组 → 选择服务商、保存 API 密钥。
 

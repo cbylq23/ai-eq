@@ -256,7 +256,8 @@ test('关闭 JSON 模式：请求不带 response_format', async () => {    const
     dispose();
 });
 
-test('模型输出不合规：超长 curve / 低置信度都不施加', async () => {
+test('模型输出不合规：超长 curve 截断后仍可施加 / 低置信度不施加', async () => {
+    /* 12 段 curve：只取前 10 段并标记 trimmed（不再整条丢弃）。 */
     const tooLong = createHost({
         song: SONG_A,
         settings: { autoApply: false },
@@ -267,8 +268,9 @@ test('模型输出不合规：超长 curve / 低置信度都不施加', async ()
     await first.ready;
     await tooLong.emit('playback.songChanged', { song: SONG_A });
     const message = await tooLong.commandDefs.get('generate').run({ values: {} });
-    assert.match(message, /失败/);
-    assert.equal(tooLong.applyCalls.length, 0);
+    assert.match(message, /已生成并施加/, '超长 curve 应截取前 10 段后生效');
+    assert.equal(tooLong.applyCalls.length, 1);
+    assert.equal(tooLong.applyCalls[0].length, 10);
     first.dispose();
 
     const lowConfidence = createHost({
@@ -656,5 +658,68 @@ test('联网资料：先搜歌名+歌手，再把摘要放进提示词（只为�
     const user = bodyOf(chat).messages[1].content;
     assert.match(user, /【联网资料】/);
     assert.match(user, /创作背景解读/);
+    dispose();
+});
+
+test('输出被截断：自动改用精简提示词重试并施加曲线', async () => {
+    const curve = [2, 1, 0, 0, -1, -1, 0, 1, 2, 1];
+    let call = 0;
+    const host = createHost({
+        fetchImpl: async () => {
+            call += 1;
+            if (call === 1) {
+                /* 第一次：完整提示词，简报写太长，curve 之前就被截断 */
+                return okResponse(chatResponse('{"genre":"City Pop","summary":"夏日海边的告白","meaning":"写的是青春期的', 'length'));
+            }
+            return okResponse(chatResponse(JSON.stringify({ genre: 'City Pop', reason: '低频稍多', curve, confidence: 0.85 })));
+        },
+    });
+    host.secretsMap.set('apiKey', 'k');
+    const { dispose, ready } = start(host);
+    await ready;
+    await host.emit('playback.songChanged', { song: SONG_A });
+    assert.ok(await waitFor(() => host.applyCalls.length === 1), '重试后应成功施加曲线');
+    assert.deepEqual(host.applyCalls[0], curve);
+    assert.equal(host.fetchCalls.length, 2, '应发起第二次请求');
+    const second = bodyOf(host.fetchCalls[1]);
+    assert.match(second.messages[0].content, /只输出一个 JSON 对象/, '第二次应是精简提示词');
+    assert.ok(!/深层含义/.test(second.messages[0].content), '精简版不再要求简报');
+    assert.ok(second.max_tokens >= 700, '预算按段数给足');
+    /* 第一次请求的 max_tokens 不再是 900 的死值 */
+    assert.ok(bodyOf(host.fetchCalls[0]).max_tokens >= 700);
+    dispose();
+});
+
+test('截断但 curve 已写出来：直接抢救成功，不重试', async () => {
+    const curve = [1, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const host = createHost({
+        fetchImpl: async () => okResponse(chatResponse(`{"genre":"Rap","curve":${JSON.stringify(curve)},"reason":"低频优先","confidence":0.8`, 'length')),
+    });
+    host.secretsMap.set('apiKey', 'k');
+    const { dispose, ready } = start(host);
+    await ready;
+    await host.emit('playback.songChanged', { song: SONG_A });
+    assert.ok(await waitFor(() => host.applyCalls.length === 1));
+    assert.deepEqual(host.applyCalls[0], curve);
+    dispose();
+});
+
+test('服务商拒绝 max_tokens：改用 max_completion_tokens 重试', async () => {
+    let call = 0;
+    const host = createHost({
+        fetchImpl: async () => {
+            call += 1;
+            if (call === 1) return errorResponse(400, '{"error":"Unsupported parameter: max_tokens"}');
+            return okResponse(chatResponse(curveContent([1, 1, 0, 0, 0, 0, 0, 0, 0, 0])));
+        },
+    });
+    host.secretsMap.set('apiKey', 'k');
+    const { dispose, ready } = start(host);
+    await ready;
+    await host.emit('playback.songChanged', { song: SONG_A });
+    assert.ok(await waitFor(() => host.applyCalls.length === 1), '应回退成功后施加');
+    const second = bodyOf(host.fetchCalls[1]);
+    assert.ok(second.max_completion_tokens >= 700);
+    assert.equal(second.max_tokens, undefined);
     dispose();
 });
